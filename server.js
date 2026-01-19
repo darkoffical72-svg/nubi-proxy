@@ -1,51 +1,26 @@
 import express from "express";
+import OpenAI from "openai";
+import { toFile } from "openai/uploads";
 
 const app = express();
 
-// ------------------- CONFIG -------------------
+// /stt RAW PCM16 alacağız (ESP32 yolluyor)
+app.use("/stt", express.raw({ type: "*/*", limit: "2mb" }));
+
+// /chat ve /tts JSON
+app.use(express.json({ limit: "200kb" }));
+
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Render health
-app.get("/", (req, res) => res.status(200).send("nubi-proxy OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// Basit test
-app.post("/ping", express.json({ limit: "50kb" }), (req, res) => {
-  res.json({ ok: true, msg: "pong", time: Date.now() });
-});
-
-// ------------------- BODY PARSERS -------------------
-// /stt: ESP32 raw pcm16 yollayacak (application/octet-stream)
-app.use("/stt", express.raw({ type: "*/*", limit: "4mb" }));
-
-// /chat ve /tts: JSON
-app.use(express.json({ limit: "300kb" }));
-
-// ------------------- SIMPLE MEMORY (RAM) -------------------
-// sessionId -> [{role, content}, ...]
-const memory = new Map();
-function getSession(sessionId = "default") {
-  if (!memory.has(sessionId)) memory.set(sessionId, []);
-  return memory.get(sessionId);
+if (!OPENAI_API_KEY) {
+  console.error("OPENAI_API_KEY yok! Render Environment'a ekle.");
 }
 
-// ------------------- HELPERS -------------------
-async function openaiFetch(url, payload, extraHeaders = {}) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY missing (set Render Env Var)");
-  }
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-      ...extraHeaders,
-    },
-    body: JSON.stringify(payload),
-  });
-  return r;
-}
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// Basit RAM içi konuşma hafızası (free plan restart edince sıfırlanır)
+const memory = new Map(); // sessionId -> [{role, content}, ...]
 
 function wavHeaderPCM16({ sampleRate, numChannels, numSamples }) {
   const bytesPerSample = 2;
@@ -57,144 +32,124 @@ function wavHeaderPCM16({ sampleRate, numChannels, numSamples }) {
   buf.write("RIFF", 0);
   buf.writeUInt32LE(36 + dataSize, 4);
   buf.write("WAVE", 8);
-
   buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16); // PCM
-  buf.writeUInt16LE(1, 20);  // PCM format
+  buf.writeUInt32LE(16, 16);          // PCM fmt chunk size
+  buf.writeUInt16LE(1, 20);           // audio format = PCM
   buf.writeUInt16LE(numChannels, 22);
   buf.writeUInt32LE(sampleRate, 24);
   buf.writeUInt32LE(byteRate, 28);
   buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(16, 34); // bits per sample
-
+  buf.writeUInt16LE(16, 34);          // bits per sample
   buf.write("data", 36);
   buf.writeUInt32LE(dataSize, 40);
   return buf;
 }
 
-// ------------------- ROUTES -------------------
+function pcm16ToWavBuffer(pcmBuf, sampleRate = 16000, numChannels = 1) {
+  const numSamples = Math.floor(pcmBuf.length / 2) / numChannels;
+  const header = wavHeaderPCM16({ sampleRate, numChannels, numSamples });
+  return Buffer.concat([header, pcmBuf]);
+}
 
-// 1) STT: RAW PCM16 -> Text
-// ESP32: POST /stt  (body = pcm16 bytes, 16kHz mono)
-// Query: ?sr=16000  (opsiyonel)
-// Header: X-Session-Id: abc (opsiyonel)
+// Health
+app.get("/", (req, res) => res.status(200).send("nubi-proxy OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ===================== STT =====================
+// ESP32 -> RAW PCM16 (little-endian) gönderiyor
 app.post("/stt", async (req, res) => {
   try {
-    const sr = Number(req.query.sr || 16000);
-    const pcm = req.body; // Buffer
-
-    if (!pcm || !Buffer.isBuffer(pcm) || pcm.length < 100) {
-      return res.status(400).json({ error: "pcm_missing_or_too_small" });
+    if (!req.body || !Buffer.isBuffer(req.body) || req.body.length < 1000) {
+      return res.json({ text: "" });
     }
 
-    // PCM16 mono -> WAV ekle
-    const numSamples = Math.floor(pcm.length / 2);
-    const wavHeader = wavHeaderPCM16({
-      sampleRate: sr,
-      numChannels: 1,
-      numSamples,
-    });
-    const wav = Buffer.concat([wavHeader, pcm]);
+    // PCM16 -> WAV dosyası gibi OpenAI'ye veriyoruz
+    const wavBuf = pcm16ToWavBuffer(req.body, 16000, 1);
+    const file = await toFile(wavBuf, "audio.wav", { type: "audio/wav" });
 
-    // OpenAI STT (Whisper)
-    // multipart/form-data gerekiyor
-    const form = new FormData();
-    const blob = new Blob([wav], { type: "audio/wav" });
-    form.append("file", blob, "audio.wav");
-    form.append("model", "whisper-1");
-
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
+    // Whisper / transcription
+    const tr = await client.audio.transcriptions.create({
+      model: "gpt-4o-mini-transcribe",
+      file,
     });
 
-    if (!r.ok) {
-      const errTxt = await r.text();
-      return res.status(500).json({ error: "stt_failed", detail: errTxt });
-    }
-
-    const j = await r.json();
-    const text = (j && j.text) ? String(j.text) : "";
+    const text = (tr.text || "").trim();
     res.json({ text });
   } catch (e) {
-    res.status(500).json({ error: "stt_exception", detail: String(e) });
+    console.error("STT error:", e?.message || e);
+    res.status(500).json({ text: "" });
   }
 });
 
-// 2) CHAT: {text, sessionId} -> {reply}
+// ===================== CHAT =====================
 app.post("/chat", async (req, res) => {
   try {
-    const text = req.body?.text ? String(req.body.text) : "";
-    const sessionId = req.body?.sessionId ? String(req.body.sessionId) : "default";
-    if (!text) return res.status(400).json({ error: "text_missing" });
+    const text = (req.body?.text || "").toString().trim();
+    const sessionId = (req.body?.sessionId || "nubi1").toString();
 
-    const history = getSession(sessionId);
+    if (!text) return res.json({ reply: "" });
 
-    // Basit prompt + hafıza
-    const messages = [
-      { role: "system", content: "Sen Nubi'sin: sevecen, kısa ve net cevap ver. Türkçe konuş." },
-      ...history,
-      { role: "user", content: text },
-    ];
+    if (!memory.has(sessionId)) memory.set(sessionId, []);
+    const history = memory.get(sessionId);
 
-    const r = await openaiFetch("https://api.openai.com/v1/chat/completions", {
-      model: "gpt-4o-mini",
+    // kısa tutalım (ESP RAM dostu)
+    history.push({ role: "user", content: text });
+    if (history.length > 8) history.splice(0, history.length - 8);
+
+    const sys = {
+      role: "system",
+      content:
+        "Sen NUBI isimli sevimli, kısa konuşan, net cevap veren bir peluş oyuncaksın. Cevapların 1-2 cümleyi geçmesin.",
+    };
+
+    const messages = [sys, ...history];
+
+    const resp = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
       messages,
-      temperature: 0.6,
+      temperature: 0.7,
+      max_tokens: 80,
     });
 
-    if (!r.ok) {
-      const errTxt = await r.text();
-      return res.status(500).json({ error: "chat_failed", detail: errTxt });
-    }
+    const reply = (resp.choices?.[0]?.message?.content || "").trim();
 
-    const j = await r.json();
-    const reply = j?.choices?.[0]?.message?.content ? String(j.choices[0].message.content) : "";
-
-    // hafızaya ekle (kısa tut)
-    history.push({ role: "user", content: text });
     history.push({ role: "assistant", content: reply });
-    if (history.length > 12) history.splice(0, history.length - 12);
+    if (history.length > 8) history.splice(0, history.length - 8);
 
     res.json({ reply });
   } catch (e) {
-    res.status(500).json({ error: "chat_exception", detail: String(e) });
+    console.error("CHAT error:", e?.message || e);
+    res.status(500).json({ reply: "" });
   }
 });
 
-// 3) TTS: {text} -> {audio_b64, format:"pcm16", sample_rate:16000}
+// ===================== TTS =====================
+// Arduino JSON gönderir, server WAV binary döndürür (JSON değil!)
 app.post("/tts", async (req, res) => {
   try {
-    const text = req.body?.text ? String(req.body.text) : "";
-    if (!text) return res.status(400).json({ error: "text_missing" });
+    const text = (req.body?.text || "").toString().trim();
+    const voice = (req.body?.voice || "alloy").toString();
 
-    const r = await openaiFetch("https://api.openai.com/v1/audio/speech", {
+    if (!text) return res.status(400).send("no text");
+
+    const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "alloy",
-      format: "pcm16",   // <<< KRITIK: MP3 degil
+      voice,
+      format: "wav", // kritik: WAV istiyoruz
       input: text,
     });
 
-    if (!r.ok) {
-      const errTxt = await r.text();
-      return res.status(500).json({ error: "tts_failed", detail: errTxt });
-    }
+    const arrayBuffer = await audioResp.arrayBuffer();
+    const wav = Buffer.from(arrayBuffer);
 
-    const ab = await r.arrayBuffer();
-    const b64 = Buffer.from(ab).toString("base64");
-
-    res.json({
-      audio_b64: b64,
-      format: "pcm16",
-      sample_rate: 16000,
-    });
+    res.setHeader("Content-Type", "audio/wav");
+    res.status(200).send(wav);
   } catch (e) {
-    res.status(500).json({ error: "tts_exception", detail: String(e) });
+    console.error("TTS error:", e?.message || e);
+    res.status(500).send("tts_error");
   }
 });
 
-// ------------------- START -------------------
 app.listen(PORT, () => {
   console.log("Nubi proxy running on port", PORT);
 });
