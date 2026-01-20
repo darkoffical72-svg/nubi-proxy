@@ -5,6 +5,7 @@ import { toFile } from "openai/uploads";
 const app = express();
 
 // /stt RAW PCM16 alacağız (ESP32 yolluyor)
+// NOTE: type: "*/*" şart, "/" yanlıştı
 app.use("/stt", express.raw({ type: "*/*", limit: "2mb" }));
 
 // /chat ve /tts JSON
@@ -53,8 +54,7 @@ function pcm16ToWavBuffer(pcmBuf, sampleRate = 16000, numChannels = 1) {
 
 // --- WAV parser (PCM16) ---
 function findChunk(buf, fourcc) {
-  // RIFF header 12 bytes, sonra chunklar
-  let off = 12;
+  let off = 12; // RIFF header 12 bytes, sonra chunklar
   while (off + 8 <= buf.length) {
     const id = buf.toString("ascii", off, off + 4);
     const size = buf.readUInt32LE(off + 4);
@@ -79,8 +79,8 @@ function parseWavPcm16(buf) {
   const sampleRate  = buf.readUInt32LE(fmt.dataOff + 4);
   const bitsPerSample = buf.readUInt16LE(fmt.dataOff + 14);
 
-  if (audioFormat !== 1) return null;       // PCM
-  if (bitsPerSample !== 16) return null;    // PCM16
+  if (audioFormat !== 1) return null;    // PCM
+  if (bitsPerSample !== 16) return null; // PCM16
 
   const pcm = buf.subarray(data.dataOff, data.dataOff + data.size);
   return { sampleRate, numChannels, pcm };
@@ -92,6 +92,7 @@ function stereoToMonoPcm16(stereoPcm) {
   const inSamples = Math.floor(stereoPcm.length / 2);
   const frames = Math.floor(inSamples / 2);
   const out = Buffer.alloc(frames * 2);
+
   for (let i = 0; i < frames; i++) {
     const L = stereoPcm.readInt16LE(i * 4);
     const R = stereoPcm.readInt16LE(i * 4 + 2);
@@ -103,8 +104,9 @@ function stereoToMonoPcm16(stereoPcm) {
 
 function resamplePcm16MonoLinear(pcm, inRate, outRate) {
   if (inRate === outRate) return pcm;
+
   const inLen = Math.floor(pcm.length / 2);
-  const outLen = Math.floor(inLen * outRate / inRate);
+  const outLen = Math.floor((inLen * outRate) / inRate);
   const out = Buffer.alloc(outLen * 2);
 
   for (let i = 0; i < outLen; i++) {
@@ -201,11 +203,12 @@ app.post("/tts", async (req, res) => {
 
     if (!text) return res.status(400).send("no text");
 
+    // KRITIK: response_format kullanılmalı (format değil)
     const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
-      format: "wav",
       input: text,
+      response_format: "wav",
     });
 
     const arrayBuffer = await audioResp.arrayBuffer();
@@ -213,14 +216,12 @@ app.post("/tts", async (req, res) => {
 
     const parsed = parseWavPcm16(wavBuf);
     if (!parsed) {
-      console.log("TTS: wav parse edilemedi, oldugu gibi donuyorum");
-      res.setHeader("Content-Type", "audio/wav");
-      return res.status(200).send(wavBuf);
+      console.log("TTS: wav parse edilemedi -> 500 (WAV degilse ESP calamaz)");
+      return res.status(500).send("tts_bad_wav");
     }
 
     let { sampleRate, numChannels, pcm } = parsed;
 
-    // debug log (Render logs'ta görürsün)
     console.log("TTS wav:", { sampleRate, numChannels, pcmBytes: pcm.length });
 
     // stereo ise mono yap
