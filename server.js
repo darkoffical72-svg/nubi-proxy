@@ -5,7 +5,6 @@ import { toFile } from "openai/uploads";
 const app = express();
 
 // /stt RAW PCM16 alacağız (ESP32 yolluyor)
-// NOTE: type: "*/*" şart, "/" yanlıştı
 app.use("/stt", express.raw({ type: "*/*", limit: "2mb" }));
 
 // /chat ve /tts JSON
@@ -34,13 +33,13 @@ function wavHeaderPCM16({ sampleRate, numChannels, numSamples }) {
   buf.writeUInt32LE(36 + dataSize, 4);
   buf.write("WAVE", 8);
   buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16); // PCM fmt chunk size
-  buf.writeUInt16LE(1, 20);  // audio format = PCM
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // PCM
   buf.writeUInt16LE(numChannels, 22);
   buf.writeUInt32LE(sampleRate, 24);
   buf.writeUInt32LE(byteRate, 28);
   buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(16, 34); // bits per sample
+  buf.writeUInt16LE(16, 34);
   buf.write("data", 36);
   buf.writeUInt32LE(dataSize, 40);
   return buf;
@@ -54,13 +53,13 @@ function pcm16ToWavBuffer(pcmBuf, sampleRate = 16000, numChannels = 1) {
 
 // --- WAV parser (PCM16) ---
 function findChunk(buf, fourcc) {
-  let off = 12; // RIFF header 12 bytes, sonra chunklar
+  let off = 12;
   while (off + 8 <= buf.length) {
     const id = buf.toString("ascii", off, off + 4);
     const size = buf.readUInt32LE(off + 4);
     const dataOff = off + 8;
     if (id === fourcc) return { id, size, dataOff };
-    off = dataOff + size + (size % 2); // padding
+    off = dataOff + size + (size % 2);
   }
   return null;
 }
@@ -76,28 +75,24 @@ function parseWavPcm16(buf) {
 
   const audioFormat = buf.readUInt16LE(fmt.dataOff + 0);
   const numChannels = buf.readUInt16LE(fmt.dataOff + 2);
-  const sampleRate  = buf.readUInt32LE(fmt.dataOff + 4);
+  const sampleRate = buf.readUInt32LE(fmt.dataOff + 4);
   const bitsPerSample = buf.readUInt16LE(fmt.dataOff + 14);
 
-  if (audioFormat !== 1) return null;    // PCM
-  if (bitsPerSample !== 16) return null; // PCM16
+  if (audioFormat !== 1) return null;
+  if (bitsPerSample !== 16) return null;
 
   const pcm = buf.subarray(data.dataOff, data.dataOff + data.size);
   return { sampleRate, numChannels, pcm };
 }
 
-// --- Mono mix + resample 24000->16000 (linear) ---
 function stereoToMonoPcm16(stereoPcm) {
-  // stereo interleaved int16: L R L R ...
   const inSamples = Math.floor(stereoPcm.length / 2);
   const frames = Math.floor(inSamples / 2);
   const out = Buffer.alloc(frames * 2);
-
   for (let i = 0; i < frames; i++) {
     const L = stereoPcm.readInt16LE(i * 4);
     const R = stereoPcm.readInt16LE(i * 4 + 2);
-    const m = (L + R) >> 1;
-    out.writeInt16LE(m, i * 2);
+    out.writeInt16LE((L + R) >> 1, i * 2);
   }
   return out;
 }
@@ -117,9 +112,7 @@ function resamplePcm16MonoLinear(pcm, inRate, outRate) {
 
     const s0 = pcm.readInt16LE(i0 * 2);
     const s1 = pcm.readInt16LE(i1 * 2);
-    const v = Math.round(s0 + (s1 - s0) * frac);
-
-    out.writeInt16LE(v, i * 2);
+    out.writeInt16LE(Math.round(s0 + (s1 - s0) * frac), i * 2);
   }
   return out;
 }
@@ -135,7 +128,6 @@ app.post("/stt", async (req, res) => {
       return res.json({ text: "" });
     }
 
-    // PCM16 -> WAV
     const wavBuf = pcm16ToWavBuffer(req.body, 16000, 1);
     const file = await toFile(wavBuf, "audio.wav", { type: "audio/wav" });
 
@@ -144,8 +136,7 @@ app.post("/stt", async (req, res) => {
       file,
     });
 
-    const text = (tr.text || "").trim();
-    res.json({ text });
+    res.json({ text: (tr.text || "").trim() });
   } catch (e) {
     console.error("STT error:", e?.message || e);
     res.status(500).json({ text: "" });
@@ -157,7 +148,6 @@ app.post("/chat", async (req, res) => {
   try {
     const text = (req.body?.text || "").toString().trim();
     const sessionId = (req.body?.sessionId || "nubi1").toString();
-
     if (!text) return res.json({ reply: "" });
 
     if (!memory.has(sessionId)) memory.set(sessionId, []);
@@ -172,11 +162,9 @@ app.post("/chat", async (req, res) => {
         "Sen NUBI isimli sevimli, kısa konuşan, net cevap veren bir peluş oyuncaksın. Cevapların 1-2 cümleyi geçmesin.",
     };
 
-    const messages = [sys, ...history];
-
     const resp = await client.chat.completions.create({
       model: "gpt-4.1-mini",
-      messages,
+      messages: [sys, ...history],
       temperature: 0.7,
       max_tokens: 80,
     });
@@ -194,43 +182,35 @@ app.post("/chat", async (req, res) => {
 });
 
 // ===================== TTS =====================
-// Arduino JSON gönderir, server WAV binary döndürür
-// Burada WAV'ı garanti 16kHz mono PCM16 yapıyoruz.
 app.post("/tts", async (req, res) => {
   try {
     const text = (req.body?.text || "").toString().trim();
     const voice = (req.body?.voice || "alloy").toString();
-
     if (!text) return res.status(400).send("no text");
 
-    // KRITIK: response_format kullanılmalı (format değil)
     const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
+      format: "wav",
       input: text,
-      response_format: "wav",
     });
 
-    const arrayBuffer = await audioResp.arrayBuffer();
-    const wavBuf = Buffer.from(arrayBuffer);
+    const wavBuf = Buffer.from(await audioResp.arrayBuffer());
 
     const parsed = parseWavPcm16(wavBuf);
     if (!parsed) {
-      console.log("TTS: wav parse edilemedi -> 500 (WAV degilse ESP calamaz)");
-      return res.status(500).send("tts_bad_wav");
+      res.setHeader("Content-Type", "audio/wav");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(wavBuf);
     }
 
     let { sampleRate, numChannels, pcm } = parsed;
 
-    console.log("TTS wav:", { sampleRate, numChannels, pcmBytes: pcm.length });
-
-    // stereo ise mono yap
     if (numChannels === 2) {
       pcm = stereoToMonoPcm16(pcm);
       numChannels = 1;
     }
 
-    // 16k değilse 16k'ya indir
     if (sampleRate !== 16000) {
       pcm = resamplePcm16MonoLinear(pcm, sampleRate, 16000);
       sampleRate = 16000;
