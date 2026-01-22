@@ -200,7 +200,7 @@ app.post("/tts", async (req, res) => {
 
     const wavBuf = Buffer.from(await audioResp.arrayBuffer());
 
-    // Parse edebilirsek: PCM16 mono + 24000'e normalize et
+    // Normalize: PCM16 mono + 24000Hz
     const parsed = parseWavPcm16(wavBuf);
 
     let outWav = wavBuf;
@@ -214,7 +214,6 @@ app.post("/tts", async (req, res) => {
         numChannels = 1;
       }
 
-      // hedef: 24000 Hz (ESP32 sen 24000'e kilitledin)
       const TARGET_RATE = 24000;
       if (sampleRate !== TARGET_RATE) {
         pcm = resamplePcm16MonoLinear(pcm, sampleRate, TARGET_RATE);
@@ -224,13 +223,12 @@ app.post("/tts", async (req, res) => {
       outWav = pcm16ToWavBuffer(pcm, sampleRate, numChannels);
     }
 
-    // >>> KRİTİK: ESP tarafında JSON/Chunked saçmalamasın diye
+    // >>> KRİTİK: Chunked olmasın, ESP net okusun
     res.status(200);
     res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Length", String(outWav.length));
     res.setHeader("Connection", "close");
-
     return res.end(outWav);
   } catch (e) {
     console.error("TTS error:", e?.message || e);
