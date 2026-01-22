@@ -190,13 +190,23 @@ app.post("/tts", async (req, res) => {
     const voice = (req.body?.voice || "alloy").toString();
     if (!text) return res.status(400).send("no text");
 
-    // OpenAI -> WAV istiyoruz
     const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
       format: "wav",
       input: text,
     });
+
+    const wavBuf = Buffer.from(await audioResp.arrayBuffer());
+
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(wavBuf);
+  } catch (e) {
+    console.error("TTS error:", e?.message || e);
+    res.status(500).send("tts_error");
+  }
+});
 
     const wavBuf = Buffer.from(await audioResp.arrayBuffer());
 
