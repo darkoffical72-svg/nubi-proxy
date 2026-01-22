@@ -183,13 +183,14 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ===================== TTS =====================
+// ===================== TTS (TEK VE DOĞRU) =====================
 app.post("/tts", async (req, res) => {
   try {
     const text = (req.body?.text || "").toString().trim();
     const voice = (req.body?.voice || "alloy").toString();
     if (!text) return res.status(400).send("no text");
 
+    // OpenAI'dan WAV iste
     const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
@@ -199,26 +200,12 @@ app.post("/tts", async (req, res) => {
 
     const wavBuf = Buffer.from(await audioResp.arrayBuffer());
 
-    res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Cache-Control", "no-store");
-    res.status(200).send(wavBuf);
-  } catch (e) {
-    console.error("TTS error:", e?.message || e);
-    res.status(500).send("tts_error");
-  }
-});
-
-    const wavBuf = Buffer.from(await audioResp.arrayBuffer());
-
-    // Parse edebilirsek: PCM16 mono 24000'e normalize et
+    // Parse edebilirsek: PCM16 mono + 24000'e normalize et
     const parsed = parseWavPcm16(wavBuf);
 
-    let outWav;
+    let outWav = wavBuf;
 
-    if (!parsed) {
-      // Parse edemediysek bile WAV binary gönder
-      outWav = wavBuf;
-    } else {
+    if (parsed) {
       let { sampleRate, numChannels, pcm } = parsed;
 
       // stereo -> mono
@@ -227,7 +214,7 @@ app.post("/tts", async (req, res) => {
         numChannels = 1;
       }
 
-      // hedef: 24000 Hz (ESP sen de 24000'e kilitledin)
+      // hedef: 24000 Hz (ESP32 sen 24000'e kilitledin)
       const TARGET_RATE = 24000;
       if (sampleRate !== TARGET_RATE) {
         pcm = resamplePcm16MonoLinear(pcm, sampleRate, TARGET_RATE);
@@ -237,12 +224,11 @@ app.post("/tts", async (req, res) => {
       outWav = pcm16ToWavBuffer(pcm, sampleRate, numChannels);
     }
 
-    // >>> KRİTİK: Chunked olmasın diye Content-Length set et
+    // >>> KRİTİK: ESP tarafında JSON/Chunked saçmalamasın diye
     res.status(200);
     res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Length", String(outWav.length));
-    // bazı proxyler için güvenli:
     res.setHeader("Connection", "close");
 
     return res.end(outWav);
