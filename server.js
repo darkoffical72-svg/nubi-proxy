@@ -22,6 +22,7 @@ const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 // Basit RAM içi konuşma hafızası
 const memory = new Map(); // sessionId -> [{role, content}, ...]
 
+// ===================== WAV HELPERS =====================
 function wavHeaderPCM16({ sampleRate, numChannels, numSamples }) {
   const bytesPerSample = 2;
   const blockAlign = numChannels * bytesPerSample;
@@ -45,7 +46,7 @@ function wavHeaderPCM16({ sampleRate, numChannels, numSamples }) {
   return buf;
 }
 
-function pcm16ToWavBuffer(pcmBuf, sampleRate = 16000, numChannels = 1) {
+function pcm16ToWavBuffer(pcmBuf, sampleRate = 24000, numChannels = 1) {
   const numSamples = Math.floor(pcmBuf.length / 2) / numChannels;
   const header = wavHeaderPCM16({ sampleRate, numChannels, numSamples });
   return Buffer.concat([header, pcmBuf]);
@@ -78,16 +79,15 @@ function parseWavPcm16(buf) {
   const sampleRate = buf.readUInt32LE(fmt.dataOff + 4);
   const bitsPerSample = buf.readUInt16LE(fmt.dataOff + 14);
 
-  if (audioFormat !== 1) return null;
-  if (bitsPerSample !== 16) return null;
+  if (audioFormat !== 1) return null;     // PCM
+  if (bitsPerSample !== 16) return null;  // PCM16
 
   const pcm = buf.subarray(data.dataOff, data.dataOff + data.size);
   return { sampleRate, numChannels, pcm };
 }
 
 function stereoToMonoPcm16(stereoPcm) {
-  const inSamples = Math.floor(stereoPcm.length / 2);
-  const frames = Math.floor(inSamples / 2);
+  const frames = Math.floor(stereoPcm.length / 4);
   const out = Buffer.alloc(frames * 2);
   for (let i = 0; i < frames; i++) {
     const L = stereoPcm.readInt16LE(i * 4);
@@ -97,6 +97,7 @@ function stereoToMonoPcm16(stereoPcm) {
   return out;
 }
 
+// Linear resample (mono PCM16)
 function resamplePcm16MonoLinear(pcm, inRate, outRate) {
   if (inRate === outRate) return pcm;
 
@@ -117,7 +118,7 @@ function resamplePcm16MonoLinear(pcm, inRate, outRate) {
   return out;
 }
 
-// Health
+// ===================== Health =====================
 app.get("/", (req, res) => res.status(200).send("nubi-proxy OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -128,6 +129,7 @@ app.post("/stt", async (req, res) => {
       return res.json({ text: "" });
     }
 
+    // ESP32 -> RAW PCM16 (16k mono) geliyor
     const wavBuf = pcm16ToWavBuffer(req.body, 16000, 1);
     const file = await toFile(wavBuf, "audio.wav", { type: "audio/wav" });
 
@@ -188,6 +190,7 @@ app.post("/tts", async (req, res) => {
     const voice = (req.body?.voice || "alloy").toString();
     if (!text) return res.status(400).send("no text");
 
+    // OpenAI -> WAV istiyoruz
     const audioResp = await client.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
@@ -197,30 +200,42 @@ app.post("/tts", async (req, res) => {
 
     const wavBuf = Buffer.from(await audioResp.arrayBuffer());
 
+    // Parse edebilirsek: PCM16 mono 24000'e normalize et
     const parsed = parseWavPcm16(wavBuf);
+
+    let outWav;
+
     if (!parsed) {
-      res.setHeader("Content-Type", "audio/wav");
-      res.setHeader("Cache-Control", "no-store");
-      return res.status(200).send(wavBuf);
+      // Parse edemediysek bile WAV binary gönder
+      outWav = wavBuf;
+    } else {
+      let { sampleRate, numChannels, pcm } = parsed;
+
+      // stereo -> mono
+      if (numChannels === 2) {
+        pcm = stereoToMonoPcm16(pcm);
+        numChannels = 1;
+      }
+
+      // hedef: 24000 Hz (ESP sen de 24000'e kilitledin)
+      const TARGET_RATE = 24000;
+      if (sampleRate !== TARGET_RATE) {
+        pcm = resamplePcm16MonoLinear(pcm, sampleRate, TARGET_RATE);
+        sampleRate = TARGET_RATE;
+      }
+
+      outWav = pcm16ToWavBuffer(pcm, sampleRate, numChannels);
     }
 
-    let { sampleRate, numChannels, pcm } = parsed;
-
-    if (numChannels === 2) {
-      pcm = stereoToMonoPcm16(pcm);
-      numChannels = 1;
-    }
-
-    if (sampleRate !== 16000) {
-      pcm = resamplePcm16MonoLinear(pcm, sampleRate, 16000);
-      sampleRate = 16000;
-    }
-
-    const fixedWav = pcm16ToWavBuffer(pcm, sampleRate, numChannels);
-
+    // >>> KRİTİK: Chunked olmasın diye Content-Length set et
+    res.status(200);
     res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Cache-Control", "no-store");
-    res.status(200).send(fixedWav);
+    res.setHeader("Content-Length", String(outWav.length));
+    // bazı proxyler için güvenli:
+    res.setHeader("Connection", "close");
+
+    return res.end(outWav);
   } catch (e) {
     console.error("TTS error:", e?.message || e);
     res.status(500).send("tts_error");
