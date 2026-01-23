@@ -1,18 +1,15 @@
-// server.js
 import express from "express";
 import OpenAI from "openai";
 import { toFile } from "openai/uploads";
 
 const app = express();
 
-// ===================== MIDDLEWARE =====================
 // /stt RAW PCM16 alacağız (ESP32 yolluyor)
 app.use("/stt", express.raw({ type: "*/*", limit: "2mb" }));
 
 // /chat ve /tts JSON
 app.use(express.json({ limit: "200kb" }));
 
-// ===================== CONFIG =====================
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -55,84 +52,18 @@ function pcm16ToWavBuffer(pcmBuf, sampleRate = 24000, numChannels = 1) {
   return Buffer.concat([header, pcmBuf]);
 }
 
-// --- WAV parser (PCM16) ---
-function findChunk(buf, fourcc) {
-  let off = 12;
-  while (off + 8 <= buf.length) {
-    const id = buf.toString("ascii", off, off + 4);
-    const size = buf.readUInt32LE(off + 4);
-    const dataOff = off + 8;
-    if (id === fourcc) return { id, size, dataOff };
-    off = dataOff + size + (size % 2);
-  }
-  return null;
-}
-
-function parseWavPcm16(buf) {
-  if (buf.length < 44) return null;
-  if (buf.toString("ascii", 0, 4) !== "RIFF") return null;
-  if (buf.toString("ascii", 8, 12) !== "WAVE") return null;
-
-  const fmt = findChunk(buf, "fmt ");
-  const data = findChunk(buf, "data");
-  if (!fmt || !data) return null;
-
-  const audioFormat = buf.readUInt16LE(fmt.dataOff + 0);
-  const numChannels = buf.readUInt16LE(fmt.dataOff + 2);
-  const sampleRate = buf.readUInt32LE(fmt.dataOff + 4);
-  const bitsPerSample = buf.readUInt16LE(fmt.dataOff + 14);
-
-  if (audioFormat !== 1) return null; // PCM
-  if (bitsPerSample !== 16) return null; // PCM16
-
-  const pcm = buf.subarray(data.dataOff, data.dataOff + data.size);
-  return { sampleRate, numChannels, pcm };
-}
-
-function stereoToMonoPcm16(stereoPcm) {
-  const frames = Math.floor(stereoPcm.length / 4);
-  const out = Buffer.alloc(frames * 2);
-  for (let i = 0; i < frames; i++) {
-    const L = stereoPcm.readInt16LE(i * 4);
-    const R = stereoPcm.readInt16LE(i * 4 + 2);
-    out.writeInt16LE((L + R) >> 1, i * 2);
-  }
-  return out;
-}
-
-// Linear resample (mono PCM16)
-function resamplePcm16MonoLinear(pcm, inRate, outRate) {
-  if (inRate === outRate) return pcm;
-
-  const inLen = Math.floor(pcm.length / 2);
-  const outLen = Math.floor((inLen * outRate) / inRate);
-  const out = Buffer.alloc(outLen * 2);
-
-  for (let i = 0; i < outLen; i++) {
-    const t = i * (inRate / outRate);
-    const i0 = Math.floor(t);
-    const i1 = Math.min(i0 + 1, inLen - 1);
-    const frac = t - i0;
-
-    const s0 = pcm.readInt16LE(i0 * 2);
-    const s1 = pcm.readInt16LE(i1 * 2);
-    out.writeInt16LE(Math.round(s0 + (s1 - s0) * frac), i * 2);
-  }
-  return out;
-}
-
-// ===================== HEALTH =====================
+// ===================== Health =====================
 app.get("/", (req, res) => res.status(200).send("nubi-proxy OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ===================== STT =====================
-// ESP32 -> RAW PCM16 (16k mono) geliyor varsayıyoruz
 app.post("/stt", async (req, res) => {
   try {
     if (!req.body || !Buffer.isBuffer(req.body) || req.body.length < 1000) {
       return res.json({ text: "" });
     }
 
+    // ESP32 -> RAW PCM16 (16k mono) geliyor, WAV'e sar
     const wavBuf = pcm16ToWavBuffer(req.body, 16000, 1);
     const file = await toFile(wavBuf, "audio.wav", { type: "audio/wav" });
 
@@ -186,78 +117,46 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ===================== TTS COMMON FUNCTION =====================
-async function makeTtsWav({ text, voice }) {
-  const audioResp = await client.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice,
-    format: "wav",
-    input: text,
-  });
-
-  const wavBuf = Buffer.from(await audioResp.arrayBuffer());
-
-  // Normalize: PCM16 mono + 24000Hz
-  const parsed = parseWavPcm16(wavBuf);
-  if (!parsed) return wavBuf;
-
-  let { sampleRate, numChannels, pcm } = parsed;
-
-  if (numChannels === 2) {
-    pcm = stereoToMonoPcm16(pcm);
-    numChannels = 1;
-  }
-
-  const TARGET_RATE = 24000;
-  if (sampleRate !== TARGET_RATE) {
-    pcm = resamplePcm16MonoLinear(pcm, sampleRate, TARGET_RATE);
-    sampleRate = TARGET_RATE;
-  }
-
-  return pcm16ToWavBuffer(pcm, sampleRate, numChannels);
-}
-
-function sendWavNoChunk(res, outWav) {
-  res.status(200);
-  res.setHeader("Content-Type", "audio/wav");
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Content-Length", String(outWav.length));
-  res.setHeader("Connection", "close");
-  return res.end(outWav);
-}
-
-// ===================== TTS (GET: BROWSER TEST) =====================
-// Tarayıcı: /tts?text=selam&voice=alloy
-app.get("/tts", async (req, res) => {
-  try {
-    const text = (req.query.text || "").toString().trim();
-    const voice = (req.query.voice || "alloy").toString();
-    if (!text) return res.status(400).send("no text");
-
-    const outWav = await makeTtsWav({ text, voice });
-    return sendWavNoChunk(res, outWav);
-  } catch (e) {
-    console.error("TTS(GET) error:", e?.message || e);
-    res.status(500).send("tts_error");
-  }
-});
-
-// ===================== TTS (POST: ESP32) =====================
+// ===================== TTS (KESİN ÇÖZÜM) =====================
+// NOT: OpenAI'da parametre adı "response_format".
+// Default mp3 döner -> ESP "RIFF yok" diye kalır.
+// Biz response_format: "pcm" isteyip WAV header ekleyip GERÇEK WAV döndürüyoruz.
 app.post("/tts", async (req, res) => {
   try {
     const text = (req.body?.text || "").toString().trim();
     const voice = (req.body?.voice || "alloy").toString();
     if (!text) return res.status(400).send("no text");
 
-    const outWav = await makeTtsWav({ text, voice });
-    return sendWavNoChunk(res, outWav);
+    const TARGET_RATE = 24000;
+    const CHANNELS = 1;
+
+    // ✅ PCM16 iste (raw), sonra WAV'e sar
+    const audioResp = await client.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice,
+      input: text,
+      response_format: "pcm", // ✅ KRİTİK
+      // speed: 1.0, // istersen aç
+    });
+
+    const pcmBuf = Buffer.from(await audioResp.arrayBuffer());
+
+    // PCM -> WAV (RIFF)
+    const outWav = pcm16ToWavBuffer(pcmBuf, TARGET_RATE, CHANNELS);
+
+    // ✅ Chunked olmasın
+    res.status(200);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Length", String(outWav.length));
+    res.setHeader("Connection", "close");
+    return res.end(outWav);
   } catch (e) {
-    console.error("TTS(POST) error:", e?.message || e);
+    console.error("TTS error:", e?.message || e);
     res.status(500).send("tts_error");
   }
 });
 
-// ===================== START =====================
 app.listen(PORT, () => {
   console.log("Nubi proxy running on port", PORT);
 });
